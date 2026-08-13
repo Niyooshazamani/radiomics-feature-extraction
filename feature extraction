@@ -1,0 +1,276 @@
+!pip install pandas openpyxl SimpleITK PyWavelets
+!pip install git+https://github.com/AIM-Harvard/pyradiomics.git
+import radiomics
+from radiomics import featureextractor
+
+print("PyRadiomics:", radiomics.__version__)
+from google.colab import drive
+drive.mount('/content/drive')
+image_dir = "/content/drive/MyDrive/mimage1"
+mask_dir  = "/content/drive/MyDrive/mmask1"
+import os
+
+print("Images:", len(os.listdir(image_dir)))
+print("Masks:", len(os.listdir(mask_dir)))
+
+print("Sample images:", os.listdir(image_dir)[:5])
+print("Sample masks:", os.listdir(mask_dir)[:5])
+import os
+
+image_files = sorted([
+    f for f in os.listdir(image_dir)
+    if f.endswith((".nii", ".nii.gz"))
+])
+
+mask_files = sorted([
+    f for f in os.listdir(mask_dir)
+    if f.endswith((".nii", ".nii.gz"))
+])
+
+print("NIfTI images:", len(image_files))
+print("NIfTI masks :", len(mask_files))
+
+# ساخت ID از اسم تصویر و ماسک
+def get_image_id(name):
+    return name.replace("processed_", "").replace("rescale.nii.gz", "").replace("rescale.nii", "")
+
+def get_mask_id(name):
+    return name.replace("mask_processed_", "").replace("rescale.nii.gz", "").replace("rescale.nii", "")
+
+image_ids = {get_image_id(f) for f in image_files}
+mask_ids  = {get_mask_id(f) for f in mask_files}
+
+print("Images without mask:", image_ids - mask_ids)
+print("Masks without image:", mask_ids - image_ids)
+import os
+import numpy as np
+import pandas as pd
+import radiomics
+from radiomics import featureextractor
+
+# -----------------------------
+# Paths
+# -----------------------------
+image_dir = "/content/drive/MyDrive/mimage1"
+mask_dir  = "/content/drive/MyDrive/mmask1"
+
+output_excel = "/content/drive/MyDrive/radiomics_features_BW8_16_32.xlsx"
+error_file   = "/content/drive/MyDrive/radiomics_extraction_errors.csv"
+
+BIN_WIDTHS = [8, 16, 32]
+
+# Feature classes requested
+FEATURE_CLASSES = [
+    "firstorder",
+    "glcm",
+    "gldm",
+    "glrlm",
+    "ngtdm"
+]
+
+# -----------------------------
+# Find image and mask files
+# -----------------------------
+image_files = sorted([
+    f for f in os.listdir(image_dir)
+    if f.endswith((".nii", ".nii.gz"))
+])
+
+mask_files = sorted([
+    f for f in os.listdir(mask_dir)
+    if f.endswith((".nii", ".nii.gz"))
+])
+
+def get_image_id(name):
+    return (
+        name.replace("processed_", "")
+            .replace("rescale.nii.gz", "")
+            .replace("rescale.nii", "")
+    )
+
+def get_mask_id(name):
+    return (
+        name.replace("mask_processed_", "")
+            .replace("rescale.nii.gz", "")
+            .replace("rescale.nii", "")
+    )
+
+mask_map = {get_mask_id(f): f for f in mask_files}
+
+print("Images:", len(image_files))
+print("Masks :", len(mask_files))
+
+# -----------------------------
+# Helper: keep only radiomics features
+# -----------------------------
+def clean_result(result):
+    clean = {}
+    for key, value in result.items():
+
+        # remove diagnostic information
+        if key.startswith("diagnostics_"):
+            continue
+
+        # convert numpy / SimpleITK numeric types to normal values
+        try:
+            value = float(value)
+        except:
+            pass
+
+        clean[key] = value
+
+    return clean
+
+
+# -----------------------------
+# SHAPE extractor
+# Shape is independent of bin width,
+# so extract only once per patient
+# -----------------------------
+shape_extractor = featureextractor.RadiomicsFeatureExtractor(
+    normalize=False,
+    resampledPixelSpacing=None,
+    label=1
+)
+
+shape_extractor.disableAllFeatures()
+shape_extractor.enableFeatureClassByName("shape")
+
+shape_extractor.disableAllImageTypes()
+shape_extractor.enableImageTypeByName("Original")
+
+
+# -----------------------------
+# Create extractor for each BW
+# -----------------------------
+extractors = {}
+
+for bw in BIN_WIDTHS:
+
+    ext = featureextractor.RadiomicsFeatureExtractor(
+        binWidth=bw,
+        normalize=False,
+        resampledPixelSpacing=None,
+        label=1
+    )
+
+    # Disable default feature classes
+    ext.disableAllFeatures()
+
+    # Enable requested feature classes
+    for feature_class in FEATURE_CLASSES:
+        ext.enableFeatureClassByName(feature_class)
+
+    # Original + Wavelet only
+    ext.disableAllImageTypes()
+    ext.enableImageTypeByName("Original")
+    ext.enableImageTypeByName(
+        "Wavelet",
+        customArgs={
+            "wavelet": "coif1",
+            "level": 1
+        }
+    )
+
+    extractors[bw] = ext
+
+
+# -----------------------------
+# Extraction loop
+# -----------------------------
+all_rows = []
+errors = []
+
+for i, image_name in enumerate(image_files, start=1):
+
+    patient_id = get_image_id(image_name)
+
+    print(f"\n[{i}/{len(image_files)}] Patient {patient_id}")
+
+    if patient_id not in mask_map:
+        print("  ERROR: mask not found")
+        errors.append({
+            "PatientID": patient_id,
+            "Error": "Mask not found"
+        })
+        continue
+
+    image_path = os.path.join(image_dir, image_name)
+    mask_path  = os.path.join(mask_dir, mask_map[patient_id])
+
+    row = {
+        "PatientID": patient_id
+    }
+
+    try:
+        # -------------------------
+        # Shape: once
+        # -------------------------
+        shape_result = clean_result(
+            shape_extractor.execute(image_path, mask_path)
+        )
+
+        for key, value in shape_result.items():
+            row[f"SHAPE_{key}"] = value
+
+
+        # -------------------------
+        # BW-specific features
+        # -------------------------
+        for bw in BIN_WIDTHS:
+
+            print(f"  Extracting BW={bw} ...")
+
+            result = clean_result(
+                extractors[bw].execute(image_path, mask_path)
+            )
+
+            for key, value in result.items():
+                row[f"BW{bw}_{key}"] = value
+
+
+        all_rows.append(row)
+        print("  Done")
+
+        # save progress after every patient
+        pd.DataFrame(all_rows).to_excel(
+            output_excel,
+            index=False
+        )
+
+    except Exception as e:
+
+        print("  ERROR:", str(e))
+
+        errors.append({
+            "PatientID": patient_id,
+            "Error": str(e)
+        })
+
+
+# -----------------------------
+# Final save
+# -----------------------------
+df = pd.DataFrame(all_rows)
+
+df.to_excel(
+    output_excel,
+    index=False
+)
+
+if len(errors) > 0:
+    pd.DataFrame(errors).to_csv(
+        error_file,
+        index=False
+    )
+
+print("\n==============================")
+print("EXTRACTION FINISHED")
+print("==============================")
+
+print("Successfully processed:", len(df))
+print("Errors:", len(errors))
+print("Total columns:", df.shape[1])
+
+print("\nSaved to:")
+print(output_excel)
