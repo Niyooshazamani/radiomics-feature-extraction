@@ -16,50 +16,206 @@ print("Masks:", len(os.listdir(mask_dir)))
 print("Sample images:", os.listdir(image_dir)[:5])
 print("Sample masks:", os.listdir(mask_dir)[:5])
 import os
+import re
+
+
+# ============================================================
+# FIND NIFTI IMAGE AND MASK FILES
+# ============================================================
 
 image_files = sorted([
     f for f in os.listdir(image_dir)
-    if f.endswith((".nii", ".nii.gz"))
+    if f.lower().endswith((".nii", ".nii.gz"))
 ])
 
 mask_files = sorted([
     f for f in os.listdir(mask_dir)
-    if f.endswith((".nii", ".nii.gz"))
+    if f.lower().endswith((".nii", ".nii.gz"))
 ])
+
 
 print("NIfTI images:", len(image_files))
 print("NIfTI masks :", len(mask_files))
 
-# ساخت ID از اسم تصویر و ماسک
+
+# ============================================================
+# EXTRACT PATIENT ID FROM FILENAME
+# ============================================================
+
+def get_patient_id(filename):
+    """
+    Extract numeric patient ID from filename.
+
+    Examples
+    --------
+    processed_486981segmented.nii
+        -> 486981
+
+    mask_processed_486981segmented.nii
+        -> 486981
+
+    processed_486981segmented.nii.gz
+        -> 486981
+    """
+
+    match = re.search(r"\d+", filename)
+
+    if match is None:
+        raise ValueError(
+            f"No numeric patient ID found in filename: {filename}"
+        )
+
+    return match.group(0)
+
+
+# For compatibility with the rest of the code
 def get_image_id(name):
-    return name.replace("processed_", "").replace("rescale.nii.gz", "").replace("rescale.nii", "")
+    return get_patient_id(name)
+
 
 def get_mask_id(name):
-    return name.replace("mask_processed_", "").replace("rescale.nii.gz", "").replace("rescale.nii", "")
+    return get_patient_id(name)
 
-image_ids = {get_image_id(f) for f in image_files}
-mask_ids  = {get_mask_id(f) for f in mask_files}
 
-print("Images without mask:", image_ids - mask_ids)
-print("Masks without image:", mask_ids - image_ids)
+# ============================================================
+# CREATE ID -> FILENAME MAPS
+# ============================================================
+
+image_map = {}
+mask_map = {}
+
+
+# ------------------------------------------------------------
+# Image map
+# ------------------------------------------------------------
+
+for filename in image_files:
+
+    patient_id = get_image_id(filename)
+
+    if patient_id in image_map:
+        raise ValueError(
+            f"Duplicate image ID detected: {patient_id}\n"
+            f"File 1: {image_map[patient_id]}\n"
+            f"File 2: {filename}"
+        )
+
+    image_map[patient_id] = filename
+
+
+# ------------------------------------------------------------
+# Mask map
+# ------------------------------------------------------------
+
+for filename in mask_files:
+
+    patient_id = get_mask_id(filename)
+
+    if patient_id in mask_map:
+        raise ValueError(
+            f"Duplicate mask ID detected: {patient_id}\n"
+            f"File 1: {mask_map[patient_id]}\n"
+            f"File 2: {filename}"
+        )
+
+    mask_map[patient_id] = filename
+
+
+# ============================================================
+# CHECK IMAGE-MASK MATCHING
+# ============================================================
+
+image_ids = set(image_map.keys())
+mask_ids = set(mask_map.keys())
+
+images_without_mask = image_ids - mask_ids
+masks_without_image = mask_ids - image_ids
+
+matched_ids = image_ids & mask_ids
+
+
+print("\n" + "=" * 60)
+print("IMAGE-MASK MATCHING REPORT")
+print("=" * 60)
+
+print("Unique image IDs :", len(image_ids))
+print("Unique mask IDs  :", len(mask_ids))
+print("Matched pairs    :", len(matched_ids))
+
+
+print("\nImages without mask:")
+if images_without_mask:
+    for patient_id in sorted(images_without_mask, key=int):
+        print(
+            f"  ID {patient_id}: "
+            f"{image_map[patient_id]}"
+        )
+else:
+    print("  None")
+
+
+print("\nMasks without image:")
+if masks_without_image:
+    for patient_id in sorted(masks_without_image, key=int):
+        print(
+            f"  ID {patient_id}: "
+            f"{mask_map[patient_id]}"
+        )
+else:
+    print("  None")
+
+
+# ============================================================
+# FINAL MATCH CHECK
+# ============================================================
+
+if not images_without_mask and not masks_without_image:
+
+    print("\nAll images and masks are matched correctly.")
+
+else:
+
+    print(
+        "\nWARNING: Some images/masks do not have a matching pair."
+    )
+# ============================================================
+# IMPORTS
+# ============================================================
+
 import os
+import re
 import numpy as np
 import pandas as pd
+import SimpleITK as sitk
 import radiomics
+
 from radiomics import featureextractor
 
-# -----------------------------
-# Paths
-# -----------------------------
+
+# ============================================================
+# PATHS
+# ============================================================
+
 image_dir = "/content/drive/MyDrive/mimage1"
 mask_dir  = "/content/drive/MyDrive/mmask1"
 
-output_excel = "/content/drive/MyDrive/radiomics_features_BW8_16_32.xlsx"
-error_file   = "/content/drive/MyDrive/radiomics_extraction_errors.csv"
+output_excel = (
+    "/content/drive/MyDrive/"
+    "radiomics_features_BW8_16_32.xlsx"
+)
 
-BIN_WIDTHS = [8, 16, 32]
+error_file = (
+    "/content/drive/MyDrive/"
+    "radiomics_extraction_errors.csv"
+)
 
-# Feature classes requested
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+BIN_WIDTHS = [25]
+
 FEATURE_CLASSES = [
     "firstorder",
     "glcm",
@@ -68,53 +224,367 @@ FEATURE_CLASSES = [
     "ngtdm"
 ]
 
-# -----------------------------
-# Find image and mask files
-# -----------------------------
+# Very small tolerance only for tiny numerical differences
+# in origin / spacing / direction.
+# This does NOT resample the images.
+GEOMETRY_TOLERANCE = 1e-6
+
+
+print("PyRadiomics version:", radiomics.__version__)
+
+
+# ============================================================
+# CHECK DIRECTORIES
+# ============================================================
+
+if not os.path.isdir(image_dir):
+    raise FileNotFoundError(
+        f"Image directory not found:\n{image_dir}"
+    )
+
+if not os.path.isdir(mask_dir):
+    raise FileNotFoundError(
+        f"Mask directory not found:\n{mask_dir}"
+    )
+
+
+# ============================================================
+# FIND NIFTI FILES
+# ============================================================
+
 image_files = sorted([
     f for f in os.listdir(image_dir)
-    if f.endswith((".nii", ".nii.gz"))
+    if f.lower().endswith((".nii", ".nii.gz"))
 ])
 
 mask_files = sorted([
     f for f in os.listdir(mask_dir)
-    if f.endswith((".nii", ".nii.gz"))
+    if f.lower().endswith((".nii", ".nii.gz"))
 ])
 
-def get_image_id(name):
-    return (
-        name.replace("processed_", "")
-            .replace("rescale.nii.gz", "")
-            .replace("rescale.nii", "")
+
+print("\nNIfTI images:", len(image_files))
+print("NIfTI masks :", len(mask_files))
+
+
+# ============================================================
+# EXTRACT PATIENT ID
+# ============================================================
+
+def get_patient_id(filename):
+    """
+    Extract patient ID from filenames such as:
+
+    processed_486981segmented.nii
+        -> 486981
+
+    mask_processed_486981segmented.nii
+        -> 486981
+    """
+
+    match = re.search(
+        r"processed_(\d+)",
+        filename,
+        re.IGNORECASE
     )
 
-def get_mask_id(name):
-    return (
-        name.replace("mask_processed_", "")
-            .replace("rescale.nii.gz", "")
-            .replace("rescale.nii", "")
+    if match is None:
+        raise ValueError(
+            "Patient ID could not be extracted from "
+            f"filename:\n{filename}"
+        )
+
+    return match.group(1)
+
+
+def get_image_id(filename):
+    return get_patient_id(filename)
+
+
+def get_mask_id(filename):
+    return get_patient_id(filename)
+
+
+# ============================================================
+# CREATE FILE MAP WITH DUPLICATE CHECKING
+# ============================================================
+
+def build_file_map(files, file_type):
+
+    file_map = {}
+
+    for filename in files:
+
+        patient_id = get_patient_id(filename)
+
+        if patient_id in file_map:
+
+            raise ValueError(
+                f"\nDuplicate {file_type} ID detected: "
+                f"{patient_id}\n"
+                f"File 1: {file_map[patient_id]}\n"
+                f"File 2: {filename}"
+            )
+
+        file_map[patient_id] = filename
+
+    return file_map
+
+
+image_map = build_file_map(
+    image_files,
+    "image"
+)
+
+mask_map = build_file_map(
+    mask_files,
+    "mask"
+)
+
+
+# ============================================================
+# CHECK IMAGE-MASK PAIRING
+# ============================================================
+
+image_ids = set(image_map.keys())
+mask_ids = set(mask_map.keys())
+
+matched_ids = image_ids & mask_ids
+
+images_without_mask = image_ids - mask_ids
+masks_without_image = mask_ids - image_ids
+
+
+print("\n" + "=" * 70)
+print("IMAGE-MASK MATCHING REPORT")
+print("=" * 70)
+
+print("Unique image IDs :", len(image_ids))
+print("Unique mask IDs  :", len(mask_ids))
+print("Matched pairs    :", len(matched_ids))
+
+
+print("\nImages without mask:")
+
+if images_without_mask:
+
+    for patient_id in sorted(
+        images_without_mask,
+        key=int
+    ):
+        print(
+            f"  {patient_id}: "
+            f"{image_map[patient_id]}"
+        )
+
+else:
+    print("  None")
+
+
+print("\nMasks without image:")
+
+if masks_without_image:
+
+    for patient_id in sorted(
+        masks_without_image,
+        key=int
+    ):
+        print(
+            f"  {patient_id}: "
+            f"{mask_map[patient_id]}"
+        )
+
+else:
+    print("  None")
+
+
+# ============================================================
+# VALIDATE IMAGE AND MASK
+# ============================================================
+
+def validate_image_mask_pair(
+    image_path,
+    mask_path,
+    tolerance=GEOMETRY_TOLERANCE
+):
+    """
+    Check geometry and determine the ROI label.
+
+    NO resampling is performed.
+
+    Returns
+    -------
+    mask_label : int
+        The single non-zero label in the mask.
+    """
+
+    image = sitk.ReadImage(image_path)
+    mask = sitk.ReadImage(mask_path)
+
+
+    # --------------------------------------------------------
+    # Dimensions
+    # --------------------------------------------------------
+
+    if image.GetDimension() != mask.GetDimension():
+
+        raise ValueError(
+            "Image and mask dimensions are different. "
+            f"Image={image.GetDimension()}, "
+            f"Mask={mask.GetDimension()}"
+        )
+
+
+    # --------------------------------------------------------
+    # Vector mask check
+    # --------------------------------------------------------
+
+    if mask.GetNumberOfComponentsPerPixel() != 1:
+
+        raise ValueError(
+            "Mask is a vector image. "
+            "This script expects a scalar label map."
+        )
+
+
+    # --------------------------------------------------------
+    # Size
+    # --------------------------------------------------------
+
+    if image.GetSize() != mask.GetSize():
+
+        raise ValueError(
+            "Image-mask SIZE mismatch.\n"
+            f"Image size: {image.GetSize()}\n"
+            f"Mask size : {mask.GetSize()}"
+        )
+
+
+    # --------------------------------------------------------
+    # Spacing
+    # --------------------------------------------------------
+
+    if not np.allclose(
+        image.GetSpacing(),
+        mask.GetSpacing(),
+        rtol=0,
+        atol=tolerance
+    ):
+
+        raise ValueError(
+            "Image-mask SPACING mismatch.\n"
+            f"Image spacing: {image.GetSpacing()}\n"
+            f"Mask spacing : {mask.GetSpacing()}"
+        )
+
+
+    # --------------------------------------------------------
+    # Origin
+    # --------------------------------------------------------
+
+    if not np.allclose(
+        image.GetOrigin(),
+        mask.GetOrigin(),
+        rtol=0,
+        atol=tolerance
+    ):
+
+        raise ValueError(
+            "Image-mask ORIGIN mismatch.\n"
+            f"Image origin: {image.GetOrigin()}\n"
+            f"Mask origin : {mask.GetOrigin()}"
+        )
+
+
+    # --------------------------------------------------------
+    # Direction
+    # --------------------------------------------------------
+
+    if not np.allclose(
+        image.GetDirection(),
+        mask.GetDirection(),
+        rtol=0,
+        atol=tolerance
+    ):
+
+        raise ValueError(
+            "Image-mask DIRECTION mismatch.\n"
+            f"Image direction: {image.GetDirection()}\n"
+            f"Mask direction : {mask.GetDirection()}"
+        )
+
+
+    # --------------------------------------------------------
+    # Detect mask label
+    # --------------------------------------------------------
+
+    mask_array = sitk.GetArrayViewFromImage(mask)
+
+    labels = np.unique(mask_array)
+
+    # Remove background
+    nonzero_labels = labels[labels != 0]
+
+
+    if len(nonzero_labels) == 0:
+
+        raise ValueError(
+            "Mask is empty. No non-zero ROI was found."
+        )
+
+
+    if len(nonzero_labels) > 1:
+
+        raise ValueError(
+            "Mask contains multiple non-zero labels: "
+            f"{nonzero_labels.tolist()}. "
+            "Expected one ROI label."
+        )
+
+
+    mask_label = int(nonzero_labels[0])
+
+
+    # --------------------------------------------------------
+    # ROI voxel count
+    # --------------------------------------------------------
+
+    roi_voxels = int(
+        np.count_nonzero(
+            mask_array == mask_label
+        )
     )
 
-mask_map = {get_mask_id(f): f for f in mask_files}
 
-print("Images:", len(image_files))
-print("Masks :", len(mask_files))
+    if roi_voxels == 0:
 
-# -----------------------------
-# Helper: keep only radiomics features
-# -----------------------------
+        raise ValueError(
+            f"No voxels found with label {mask_label}."
+        )
+
+
+    return mask_label, roi_voxels
+
+
+# ============================================================
+# CLEAN PYRADIOMICS RESULT
+# ============================================================
+
 def clean_result(result):
+
     clean = {}
+
     for key, value in result.items():
 
-        # remove diagnostic information
+        # Skip PyRadiomics diagnostic information
         if key.startswith("diagnostics_"):
             continue
 
-        # convert numpy / SimpleITK numeric types to normal values
+        # Convert numpy / SimpleITK numeric objects
+        # into standard Python numeric values
         try:
             value = float(value)
-        except:
+        except (TypeError, ValueError):
             pass
 
         clean[key] = value
@@ -122,155 +592,523 @@ def clean_result(result):
     return clean
 
 
-# -----------------------------
-# SHAPE extractor
-# Shape is independent of bin width,
-# so extract only once per patient
-# -----------------------------
-shape_extractor = featureextractor.RadiomicsFeatureExtractor(
-    normalize=False,
-    resampledPixelSpacing=None,
-    label=1
+# ============================================================
+# SHAPE EXTRACTOR
+# ============================================================
+#
+# Shape is independent of bin width.
+# Therefore, shape is calculated only once per patient.
+#
+# NO RESAMPLING.
+# ============================================================
+
+shape_extractor = (
+    featureextractor.RadiomicsFeatureExtractor(
+        normalize=False,
+
+        # No resampling
+        resampledPixelSpacing=None,
+
+        # Do not automatically resample/correct mask
+        correctMask=False,
+
+        geometryTolerance=GEOMETRY_TOLERANCE,
+
+        # Diagnostics are not required in Excel
+        additionalInfo=False
+    )
 )
 
 shape_extractor.disableAllFeatures()
-shape_extractor.enableFeatureClassByName("shape")
+
+shape_extractor.enableFeatureClassByName(
+    "shape"
+)
 
 shape_extractor.disableAllImageTypes()
-shape_extractor.enableImageTypeByName("Original")
+
+shape_extractor.enableImageTypeByName(
+    "Original"
+)
 
 
-# -----------------------------
-# Create extractor for each BW
-# -----------------------------
+# ============================================================
+# CREATE EXTRACTOR FOR EACH BIN WIDTH
+# ============================================================
+
 extractors = {}
+
 
 for bw in BIN_WIDTHS:
 
-    ext = featureextractor.RadiomicsFeatureExtractor(
-        binWidth=bw,
-        normalize=False,
-        resampledPixelSpacing=None,
-        label=1
+    ext = (
+        featureextractor.RadiomicsFeatureExtractor(
+
+            binWidth=bw,
+
+            normalize=False,
+
+            # -----------------------------------------------
+            # IMPORTANT:
+            # NO RESAMPLING
+            # -----------------------------------------------
+            resampledPixelSpacing=None,
+
+            # Do not automatically resample mask
+            correctMask=False,
+
+            geometryTolerance=GEOMETRY_TOLERANCE,
+
+            additionalInfo=False
+        )
     )
 
-    # Disable default feature classes
+
+    # --------------------------------------------------------
+    # Disable all feature classes first
+    # --------------------------------------------------------
+
     ext.disableAllFeatures()
 
-    # Enable requested feature classes
-    for feature_class in FEATURE_CLASSES:
-        ext.enableFeatureClassByName(feature_class)
 
-    # Original + Wavelet only
+    # --------------------------------------------------------
+    # Enable requested feature classes
+    # --------------------------------------------------------
+
+    for feature_class in FEATURE_CLASSES:
+
+        ext.enableFeatureClassByName(
+            feature_class
+        )
+
+
+    # --------------------------------------------------------
+    # Image types:
+    # Original + Wavelet
+    # --------------------------------------------------------
+
     ext.disableAllImageTypes()
-    ext.enableImageTypeByName("Original")
+
+
+    ext.enableImageTypeByName(
+        "Original"
+    )
+
+
     ext.enableImageTypeByName(
         "Wavelet",
         customArgs={
             "wavelet": "coif1",
-            "level": 1
+            "level": 1,
+            "start_level": 0
         }
     )
+
 
     extractors[bw] = ext
 
 
-# -----------------------------
-# Extraction loop
-# -----------------------------
+# ============================================================
+# EXTRACTION
+# ============================================================
+
 all_rows = []
+
 errors = []
 
-for i, image_name in enumerate(image_files, start=1):
 
-    patient_id = get_image_id(image_name)
+# ------------------------------------------------------------
+# Add pairing errors before extraction
+# ------------------------------------------------------------
 
-    print(f"\n[{i}/{len(image_files)}] Patient {patient_id}")
+for patient_id in sorted(
+    images_without_mask,
+    key=int
+):
 
-    if patient_id not in mask_map:
-        print("  ERROR: mask not found")
-        errors.append({
-            "PatientID": patient_id,
-            "Error": "Mask not found"
-        })
-        continue
+    errors.append({
+        "PatientID": patient_id,
+        "ImageFile": image_map[patient_id],
+        "MaskFile": "",
+        "Error": "Mask not found"
+    })
 
-    image_path = os.path.join(image_dir, image_name)
-    mask_path  = os.path.join(mask_dir, mask_map[patient_id])
+
+for patient_id in sorted(
+    masks_without_image,
+    key=int
+):
+
+    errors.append({
+        "PatientID": patient_id,
+        "ImageFile": "",
+        "MaskFile": mask_map[patient_id],
+        "Error": "Image not found"
+    })
+
+
+# ------------------------------------------------------------
+# Only process correctly paired patients
+# ------------------------------------------------------------
+
+patient_ids = sorted(
+    matched_ids,
+    key=int
+)
+
+
+print("\n" + "=" * 70)
+print("STARTING RADIOMICS EXTRACTION")
+print("=" * 70)
+
+
+for i, patient_id in enumerate(
+    patient_ids,
+    start=1
+):
+
+    image_name = image_map[patient_id]
+    mask_name = mask_map[patient_id]
+
+
+    image_path = os.path.join(
+        image_dir,
+        image_name
+    )
+
+    mask_path = os.path.join(
+        mask_dir,
+        mask_name
+    )
+
+
+    print(
+        f"\n[{i}/{len(patient_ids)}] "
+        f"Patient {patient_id}"
+    )
+
+    print(
+        f"  Image: {image_name}"
+    )
+
+    print(
+        f"  Mask : {mask_name}"
+    )
+
 
     row = {
-        "PatientID": patient_id
+        "PatientID": patient_id,
+        "ImageFile": image_name,
+        "MaskFile": mask_name
     }
 
+
     try:
-        # -------------------------
-        # Shape: once
-        # -------------------------
-        shape_result = clean_result(
-            shape_extractor.execute(image_path, mask_path)
+
+        # ====================================================
+        # STEP 1
+        # Validate image and mask
+        # ====================================================
+
+        mask_label, roi_voxels = (
+            validate_image_mask_pair(
+                image_path,
+                mask_path
+            )
         )
+
+
+        print(
+            f"  Mask label: {mask_label}"
+        )
+
+        print(
+            f"  ROI voxels: {roi_voxels}"
+        )
+
+
+        row["MaskLabel"] = mask_label
+        row["ROIVoxels"] = roi_voxels
+
+
+        # ====================================================
+        # STEP 2
+        # Shape features
+        # ====================================================
+
+        print(
+            "  Extracting shape features ..."
+        )
+
+
+        shape_result = clean_result(
+
+            shape_extractor.execute(
+                image_path,
+                mask_path,
+                label=mask_label
+            )
+        )
+
 
         for key, value in shape_result.items():
-            row[f"SHAPE_{key}"] = value
+
+            row[
+                f"SHAPE_{key}"
+            ] = value
 
 
-        # -------------------------
+        # ====================================================
+        # STEP 3
         # BW-specific features
-        # -------------------------
+        # ====================================================
+
         for bw in BIN_WIDTHS:
 
-            print(f"  Extracting BW={bw} ...")
-
-            result = clean_result(
-                extractors[bw].execute(image_path, mask_path)
+            print(
+                f"  Extracting BW={bw} ..."
             )
 
-            for key, value in result.items():
-                row[f"BW{bw}_{key}"] = value
 
+            result = clean_result(
+
+                extractors[bw].execute(
+                    image_path,
+                    mask_path,
+                    label=mask_label
+                )
+            )
+
+
+            for key, value in result.items():
+
+                row[
+                    f"BW{bw}_{key}"
+                ] = value
+
+
+        # ====================================================
+        # Successful patient
+        # ====================================================
 
         all_rows.append(row)
+
         print("  Done")
 
-        # save progress after every patient
-        pd.DataFrame(all_rows).to_excel(
-            output_excel,
-            index=False
-        )
+
+        # ====================================================
+        # SAVE PROGRESS
+        # ====================================================
+
+        try:
+
+            pd.DataFrame(
+                all_rows
+            ).to_excel(
+                output_excel,
+                index=False
+            )
+
+        except Exception as save_error:
+
+            print(
+                "  WARNING: Could not save "
+                "intermediate Excel file:"
+            )
+
+            print(
+                f"  {save_error}"
+            )
+
 
     except Exception as e:
 
-        print("  ERROR:", str(e))
+        error_message = str(e)
+
+        print(
+            "  ERROR:",
+            error_message
+        )
+
 
         errors.append({
-            "PatientID": patient_id,
-            "Error": str(e)
+
+            "PatientID":
+                patient_id,
+
+            "ImageFile":
+                image_name,
+
+            "MaskFile":
+                mask_name,
+
+            "Error":
+                error_message
         })
 
 
-# -----------------------------
-# Final save
-# -----------------------------
-df = pd.DataFrame(all_rows)
+        # Save errors progressively
+        try:
+
+            pd.DataFrame(
+                errors
+            ).to_csv(
+                error_file,
+                index=False
+            )
+
+        except Exception:
+            pass
+
+
+# ============================================================
+# FINAL SAVE
+# ============================================================
+
+df = pd.DataFrame(
+    all_rows
+)
+
 
 df.to_excel(
     output_excel,
     index=False
 )
 
+
+# ------------------------------------------------------------
+# Save errors
+# ------------------------------------------------------------
+
 if len(errors) > 0:
-    pd.DataFrame(errors).to_csv(
+
+    error_df = pd.DataFrame(
+        errors
+    )
+
+    error_df.to_csv(
         error_file,
         index=False
     )
 
-print("\n==============================")
-print("EXTRACTION FINISHED")
-print("==============================")
+else:
 
-print("Successfully processed:", len(df))
-print("Errors:", len(errors))
-print("Total columns:", df.shape[1])
+    # Remove an old error file from a previous run
+    # so it is not mistaken for a current error report.
+    if os.path.exists(error_file):
 
-print("\nSaved to:")
-print(output_excel)
+        os.remove(error_file)
+
+
+# ============================================================
+# FINAL REPORT
+# ============================================================
+
+print("\n")
+print("=" * 70)
+print("RADIOMICS EXTRACTION FINISHED")
+print("=" * 70)
+
+
+print(
+    "Total image files:",
+    len(image_files)
+)
+
+print(
+    "Total mask files:",
+    len(mask_files)
+)
+
+print(
+    "Matched patients:",
+    len(patient_ids)
+)
+
+print(
+    "Successfully processed:",
+    len(df)
+)
+
+print(
+    "Errors:",
+    len(errors)
+)
+
+
+if len(df) > 0:
+
+    print(
+        "Total output columns:",
+        df.shape[1]
+    )
+
+
+print("\nRadiomics features saved to:")
+
+print(
+    output_excel
+)
+
+
+if len(errors) > 0:
+
+    print(
+        "\nError report saved to:"
+    )
+
+    print(
+        error_file
+    )
+import pandas as pd
+import numpy as np
+
+# فایل استخراج‌شده
+input_file = "/content/drive/MyDrive/radiomics_features_BW8_16_32.xlsx"
+output_file = "/content/drive/MyDrive/radiomics_features_corr90_filtered.xlsx"
+
+df = pd.read_excel(input_file)
+
+# Patient ID جدا بماند
+patient_id = df["PatientID"]
+
+# فقط featureهای عددی
+X = df.drop(columns=["PatientID"]).select_dtypes(include=[np.number])
+
+print("Initial features:", X.shape[1])
+
+# حذف featureهای ثابت
+constant_cols = X.columns[X.nunique() <= 1]
+X = X.drop(columns=constant_cols)
+
+print("Constant features removed:", len(constant_cols))
+
+# Spearman correlation
+corr_matrix = X.corr(method="spearman").abs()
+
+# فقط نیمه بالایی ماتریس
+upper = corr_matrix.where(
+    np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
+)
+
+# اگر correlation > 0.95 باشد، یکی از دو feature حذف می‌شود
+to_drop = [
+
+    column for column in upper.columns
+    if any(upper[column] > 0.95)
+]
+
+X_filtered = X.drop(columns=to_drop)
+
+# ذخیره خروجی
+df_filtered = pd.concat(
+    [patient_id.reset_index(drop=True),
+     X_filtered.reset_index(drop=True)],
+    axis=1
+)
+
+df_filtered.to_excel(output_file, index=False)
+
+print("Highly correlated features removed:", len(to_drop))
+print("Remaining features:", X_filtered.shape[1])
+print("Saved to:", output_file)
